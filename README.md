@@ -1,2 +1,2 @@
 # DeployCI-CDPabloOsorno
-Despliegue Automatico 
+Despliegue Automatico de un Pipeline CI/CD el ambiente de desarrollo hasta produccion
