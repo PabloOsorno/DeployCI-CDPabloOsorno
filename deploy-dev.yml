@@ -1,0 +1,403 @@
+name: CI/CD OracleApp - HybridFlow
+
+on:
+  push:
+    branches:
+      - pablo-dev
+      - develop
+      - main
+
+  workflow_dispatch:
+    inputs:
+      scheduled_time_cr:
+        description: "Fecha y hora en COSTA RICA (YYYY-MM-DD HH:MM)"
+        required: true
+        type: string
+
+      run_migrations:
+        description: "¿Ejecutar migraciones en PRODUCCIÓN?"
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+concurrency:
+  group: oracleapp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ======================================================
+  # BUILD & TEST
+  # ======================================================
+  build-test:
+    name: Build, Test & Quality Check
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Mostrar entorno del runner
+        run: |
+          echo "Runner activo: $(hostname)"
+          uname -a
+      # ---------- FRONTEND ----------
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18.x"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Instalar dependencias frontend
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Ejecutar pruebas Jest del frontend
+        env:
+          CI: true
+        working-directory: ./frontend
+        run: npm test -- --watchAll=false
+
+      # ---------- BACKEND ----------
+      - name: Verificar PHP & Composer
+        run: |
+          php -v
+          composer --version
+      - name: Instalar dependencias backend
+        working-directory: ./backend
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Preparar entorno Laravel
+        working-directory: ./backend
+        run: |
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+          php artisan key:generate --force
+      - name: Ejecutar pruebas backend (PHPUnit)
+        working-directory: ./backend
+        run: |
+          if ls tests/**/*.php >/dev/null 2>&1; then
+            php artisan test --no-interaction
+          else
+            echo "No hay pruebas en Laravel."
+          fi
+  # ======================================================
+  # DEPLOY DESARROLLO (PROXMOX)
+  # ======================================================
+  deploy-dev:
+    name: Deploy to Development (Proxmox)
+    needs: build-test
+    if: contains(fromJson('["refs/heads/develop", "refs/heads/pablo-dev"]'), github.ref)
+    runs-on: self-hosted
+
+    steps:
+      - name: Deploy en Proxmox (DEV)
+        run: |
+          echo "🚀 Deploy en DEV..."
+          ssh -o StrictHostKeyChecking=no ubuntu@10.50.31.23 "
+            set -e
+            echo '➡ DEPLOY FRONTEND DEV'
+            cd /var/www/html/HybridFlow-OracleApp
+            git fetch origin develop
+            git reset --hard origin/develop
+            git pull origin develop
+            # =========================
+            # FRONTEND DEV
+            # =========================
+            cd frontend
+            npm ci --legacy-peer-deps
+            npm run build
+            sudo rm -rf /var/www/html/frontend-app/*
+            sudo mkdir -p /var/www/html/frontend-app
+            sudo cp -r build/* /var/www/html/frontend-app/
+            echo '✔ Frontend actualizado en DEV'
+            # =========================
+            # BACKEND DEV (LARAVEL)
+            # =========================
+            cd /var/www/html/HybridFlow-OracleApp/backend
+            sudo chown -R ubuntu:www-data storage bootstrap/cache
+            sudo chmod -R 775 storage bootstrap/cache
+            composer install --no-interaction --prefer-dist --optimize-autoloader
+            if ! composer show | grep -q 'yajra/laravel-oci8'; then
+              composer require yajra/laravel-oci8:\"^9.5\" --no-interaction
+            fi
+            php artisan config:clear
+            php artisan cache:clear
+            php artisan optimize:clear
+            php artisan config:cache
+            php artisan tinker --execute=\"DB::connection()->getPdo();\" \
+              && echo 'Oracle OK en DEV.' \
+              || { echo '❌ Oracle FAIL en DEV'; exit 1; }
+            php artisan migrate --force
+          "
+  # ======================================================
+  # ESPERAR HASTA LA HORA PROGRAMADA
+  # ======================================================
+  wait-for-prod:
+    name: Esperar hasta la hora programada
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: github.event_name == 'workflow_dispatch'
+
+    outputs:
+      run_migrations: ${{ github.event.inputs.run_migrations }}
+
+    steps:
+      - name: Convertir hora CR → UTC
+        id: convert
+        run: |
+          CR_RAW="${{ github.event.inputs.scheduled_time_cr }}"
+          CR_TIME=$(echo "$CR_RAW" | tr -d '\r' | tr -d '"' | xargs)
+          echo "Hora ingresada (CR): $CR_TIME"
+          if ! UTC_TIME=$(TZ="America/Costa_Rica" date -d "$CR_TIME" --utc +"%Y-%m-%d %H:%M:%S" 2>/dev/null); then
+            echo "❌ ERROR: No se pudo interpretar la fecha"
+            exit 1
+          fi
+          echo "utc_time=$UTC_TIME" >> $GITHUB_OUTPUT
+      - name: Calcular tiempo de espera
+        id: calc
+        run: |
+          TARGET="${{ steps.convert.outputs.utc_time }}"
+          TARGET_TS=$(date -d "$TARGET" +%s)
+          NOW_TS=$(date -u +%s)
+          if [ "$TARGET_TS" -le "$NOW_TS" ]; then
+            echo "❌ ERROR: La hora ya pasó"
+            exit 1
+          fi
+          WAIT=$(( TARGET_TS - NOW_TS ))
+          echo "wait_seconds=$WAIT" >> $GITHUB_OUTPUT
+      - name: Esperando...
+        run: sleep ${{ steps.calc.outputs.wait_seconds }}
+
+
+  # ======================================================
+  # Deploy Producción (VMware via SSH Tunnel)
+  # ======================================================
+
+  deploy-prod:
+    name: Deploy to Production (VMware via SSH Tunnel)
+    needs: wait-for-prod
+    runs-on: self-hosted
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+
+      # ======================================================
+      # 0) Fix global anti-freeze (locks de apt/dpkg/man-db)
+      # ======================================================
+      - name: Hard fix apt freeze
+        run: |
+          echo "⚙ Aplicando fix anti-freeze..."
+          sudo killall -9 apt-get || true
+          sudo killall -9 apt || true
+          sudo killall -9 dpkg || true
+          sudo killall -9 man || true
+          sudo rm -f /var/lib/dpkg/lock
+          sudo rm -f /var/lib/dpkg/lock-frontend
+          sudo rm -f /var/cache/apt/archives/lock
+          echo "path-exclude=/usr/share/man/*" | sudo tee /etc/dpkg/dpkg.cfg.d/01_nodoc
+          echo "path-exclude=/usr/share/doc/*" | sudo tee -a /etc/dpkg/dpkg.cfg.d/01_nodoc
+          echo "path-exclude=/usr/share/doc-base/*" | sudo tee -a /etc/dpkg/dpkg.cfg.d/01_nodoc
+          sudo dpkg --configure -a || true
+          echo "✔ Fix apt completado"
+
+      # ======================================================
+      # 1) Instalar sshpass en runner
+      # ======================================================
+      - name: Install sshpass
+        run: |
+          echo "📦 Instalando sshpass..."
+          sudo killall -9 apt-get || true
+          sudo killall -9 apt || true
+          sudo killall -9 dpkg || true
+          sudo rm -f /var/lib/dpkg/lock
+          sudo rm -f /var/lib/dpkg/lock-frontend
+          sudo rm -f /var/cache/apt/archives/lock
+          sudo dpkg --configure -a || true
+          sudo apt-get update -y
+          sudo apt-get install -y sshpass --no-install-recommends
+          echo "✔ sshpass instalado correctamente"
+
+      # ======================================================
+      # 2) DEPLOY COMPLETO EN VMWARE
+      # ======================================================
+      - name: Deploy PRODUCCIÓN
+        env:
+          RUN_MIGRATIONS: ${{ needs.wait-for-prod.outputs.run_migrations }}
+
+        run: |
+          echo "⚡ Iniciando deploy producción..."
+          ssh -o StrictHostKeyChecking=no ubuntu@10.50.31.23 << 'PROXMOX'
+          ssh -p 43000 -o StrictHostKeyChecking=no ubuntu@localhost << 'VMWARE'
+          set -e
+          echo "🚀 DEPLOY EN VMWARE INICIADO"
+
+          # ======================================================
+          # ACTUALIZAR CÓDIGO
+          # ======================================================
+          cd /var/www/html/HybridFlow-OracleApp
+          git fetch origin main
+          git reset --hard origin/main
+          echo "✔ Código actualizado desde MAIN"
+
+          # ======================================================
+          # FRONTEND
+          # ======================================================
+          cd frontend
+          npm install --legacy-peer-deps
+          npm run build
+          sudo rm -rf /var/www/html/frontend-app
+          sudo mkdir -p /var/www/html/frontend-app
+          sudo cp -r build/* /var/www/html/frontend-app/
+          echo "✔ Frontend desplegado correctamente"
+
+          # ======================================================
+          # BACKEND
+          # ======================================================
+          cd ../backend
+          sudo chown -R ubuntu:www-data storage bootstrap/cache
+          sudo chmod -R 775 storage bootstrap/cache
+
+          echo "🛡 Asegurando PHP 8.1 en Apache..."
+          sudo a2enmod php8.1 >/dev/null 2>&1 || true
+
+          sudo bash -c 'cat > /etc/apache2/sites-available/000-default.conf' << "EOF"
+          <VirtualHost *:80>
+              ServerAdmin webmaster@localhost
+              DocumentRoot /var/www/html/HybridFlow-OracleApp/backend/public
+              <Directory /var/www/html/HybridFlow-OracleApp/backend/public>
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              ErrorLog ${APACHE_LOG_DIR}/backend-error.log
+              CustomLog ${APACHE_LOG_DIR}/backend-access.log combined
+          </VirtualHost>
+          EOF
+
+          sudo systemctl reload apache2
+
+          # ======================================================
+          # INSTALL DEPENDENCIES SAFELY IN PRODUCTION
+          # ======================================================
+          COMPOSER_ALLOW_SUPERUSER=1 php -d error_reporting=0 $(which composer) install --no-interaction --prefer-dist --optimize-autoloader
+
+          echo "📦 Instalando Yajra SOLO en producción..."
+          COMPOSER_ALLOW_SUPERUSER=1 php -d error_reporting=0 $(which composer) require yajra/laravel-oci8:^9.0 --no-interaction
+
+          echo "🛠 Registrando provider de Yajra..."
+          if ! grep -q "Yajra\\\\Oci8\\\\Oci8ServiceProvider::class" config/app.php; then
+            sed -i "/'providers' => \[/a\        Yajra\\\\Oci8\\\\Oci8ServiceProvider::class," config/app.php
+          fi
+
+          # ======================================================
+          # REBUILD LARAVEL CACHE
+          # ======================================================
+          php artisan config:clear
+          php artisan cache:clear
+          php artisan route:clear
+          php artisan optimize:clear
+          php artisan config:cache
+
+          echo "🔌 Probando conexión Oracle vía Laravel (CLI)..."
+          php artisan tinker --execute="DB::connection()->getPdo();" \
+            && echo "✔ Oracle OK (CLI)" \
+            || { echo "❌ Oracle FAIL (CLI)"; exit 1; }
+
+          # ======================================================
+          # MIGRACIONES
+          # ======================================================
+          echo "🔍 RUN_MIGRATIONS = '$RUN_MIGRATIONS'"
+          if [ "$RUN_MIGRATIONS" = "yes" ]; then
+            php artisan migrate --force || { echo "❌ Migraciones fallaron"; exit 1; }
+          else
+            echo "⚠ Migraciones NO ejecutadas"
+          fi
+
+          echo "✔ DEPLOY VMWARE COMPLETADO"
+
+          # ======================================================
+          # BACKUP ORACLE
+          # ======================================================
+          echo "📦 Ejecutando backup Oracle..."
+          DUMP_NAME=hybridflow_$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR=/var/backups/hybridflow/$DUMP_NAME
+          sudo mkdir -p "$BACKUP_DIR"
+
+          sshpass -p "UTNGRUPO02**" ssh -o StrictHostKeyChecking=no Administrador@137.0.30.3 \
+            "cd C:/Oracle19c/bin && \
+            expdp.exe GRUPO02/Grupo02*@ORCL DIRECTORY=DATA_PUMP_DIR \
+            DUMPFILE=${DUMP_NAME}.dmp LOGFILE=${DUMP_NAME}.log \
+            SCHEMAS=GRUPO02 COMPRESSION=ALL"
+
+          sshpass -p "UTNGRUPO02**" scp -o StrictHostKeyChecking=no \
+            Administrador@137.0.30.3:\"C:/app/oracle/admin/orcl/dpdump/${DUMP_NAME}.dmp\" "$BACKUP_DIR/"
+
+          sshpass -p "UTNGRUPO02**" scp -o StrictHostKeyChecking=no \
+            Administrador@137.0.30.3:\"C:/app/oracle/admin/orcl/dpdump/${DUMP_NAME}.log\" "$BACKUP_DIR/"
+
+          echo "✔ Backup Oracle guardado en $BACKUP_DIR"
+          VMWARE
+          PROXMOX
+
+      # ======================================================
+      # 4) HEALTH CHECK FINAL
+      # ======================================================
+      - name: Health Check Oracle (Proxmox → VMware)
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@10.50.31.23 << 'CHECK'
+          ssh -p 43000 -o StrictHostKeyChecking=no ubuntu@localhost << 'VMWARE'
+          echo "⏳ Esperando Apache (5s)..."
+          sleep 5
+          for i in {1..5}; do
+            RESP=$(curl -s http://localhost/oracle-test || true)
+            echo "Intento $i: $RESP"
+            echo "$RESP" | grep -q "Conectado a Oracle correctamente" && {
+              echo "✔ Oracle OK vía Apache"
+              exit 0
+            }
+            sleep 3
+          done
+          echo "❌ Oracle NO respondió correctamente"
+          exit 1
+          VMWARE
+          CHECK
+
+
+  # ======================================================
+  # 3) Notificación a Discord
+  # ======================================================
+  notify-discord:
+    name: Notificar a Discord
+    needs: [deploy-prod]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Enviar notificación a Discord
+        run: |
+          STATUS="${{ job.status }}"
+          COLOR="16711680" # rojo
+          if [ "$STATUS" = "success" ]; then
+            COLOR="3066993" # verde
+          fi
+          PAYLOAD=$(jq -n \
+            --arg content "**CI/CD HybridFlow**" \
+            --arg status "$STATUS" \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson color "$COLOR" \
+            '{content: $content,
+              embeds: [
+                {
+                  title: "Estado del Pipeline",
+                  description: ("Resultado: **" + $status + "**\n[Ver ejecución](" + $url + ")"),
+                  color: $color
+                }
+              ]
+            }')
+          curl -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              ${{ secrets.DISCORD_WEBHOOK }}
